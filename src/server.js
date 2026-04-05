@@ -153,6 +153,15 @@ async function syncAllowedOrigins() {
   if (!publicDomain) return;
 
   const origin = `https://${publicDomain}`;
+
+  const current = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["config", "get", "gateway.controlUi.allowedOrigins"]),
+  );
+  if (current.code === 0 && current.output.includes(origin)) {
+    return;
+  }
+
   const result = await runCmd(
     OPENCLAW_NODE,
     clawArgs([
@@ -173,34 +182,47 @@ async function syncAllowedOrigins() {
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
+let gatewayRestartCount = 0;
+let gatewayLastStartTime = 0;
+let intentionalRestart = false;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+async function probeGatewayOnce() {
+  const endpoints = ["/openclaw", "/", "/health"];
+
+  for (const endpoint of endpoints) {
+    try {
+      const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
+        method: "GET",
+      });
+      if (res) {
+        return { ok: true, endpoint };
+      }
+    } catch (err) {
+      if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
+        const msg = err.code || err.message;
+        if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
+          log.warn("gateway", `health check error: ${msg}`);
+        }
+      }
+    }
+  }
+
+  return { ok: false, endpoint: null };
+}
+
 async function waitForGatewayReady(opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const start = Date.now();
-  const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
 
   while (Date.now() - start < timeoutMs) {
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
-          method: "GET",
-        });
-        if (res) {
-          log.info("gateway", `ready at ${endpoint}`);
-          return true;
-        }
-      } catch (err) {
-        if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
-          const msg = err.code || err.message;
-          if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
-            log.warn("gateway", `health check error: ${msg}`);
-          }
-        }
-      }
+    const probe = await probeGatewayOnce();
+    if (probe.ok) {
+      log.info("gateway", `ready at ${probe.endpoint}`);
+      return true;
     }
     await sleep(250);
   }
@@ -232,6 +254,7 @@ async function startGateway() {
     "--allow-unconfigured",
   ];
 
+  gatewayLastStartTime = Date.now();
   gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
     stdio: "inherit",
     env: {
@@ -256,16 +279,35 @@ async function startGateway() {
 
   gatewayProc.on("exit", (code, signal) => {
     log.error("gateway", `exited code=${code} signal=${signal}`);
+    const uptime = Date.now() - gatewayLastStartTime;
     gatewayProc = null;
-    if (!shuttingDown && isConfigured()) {
-      log.info("gateway", "scheduling auto-restart in 2s...");
-      setTimeout(() => {
-        if (!shuttingDown && !gatewayProc && isConfigured()) {
-          ensureGatewayRunning().catch((err) => {
-            log.error("gateway", `auto-restart failed: ${err.message}`);
-          });
+    if (!shuttingDown && !intentionalRestart && isConfigured()) {
+      if (uptime > 30_000) {
+        gatewayRestartCount = 0;
+      } else {
+        gatewayRestartCount++;
+      }
+      const delay = Math.min(2000 * Math.pow(2, gatewayRestartCount), 60_000);
+      log.info("gateway", `scheduling auto-restart in ${delay / 1000}s (attempt ${gatewayRestartCount}, uptime ${Math.round(uptime / 1000)}s)...`);
+      setTimeout(async () => {
+        if (shuttingDown || gatewayProc || !isConfigured()) {
+          return;
         }
-      }, 2000);
+
+        const probe = await probeGatewayOnce();
+        if (probe.ok) {
+          log.info(
+            "gateway",
+            `gateway still reachable at ${probe.endpoint}; assuming OpenClaw restarted itself`,
+          );
+          gatewayRestartCount = 0;
+          return;
+        }
+
+        ensureGatewayRunning().catch((err) => {
+          log.error("gateway", `auto-restart failed: ${err.message}`);
+        });
+      }, delay);
     }
   });
 }
@@ -273,6 +315,10 @@ async function startGateway() {
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
   if (gatewayProc) return { ok: true };
+  const probe = await probeGatewayOnce();
+  if (probe.ok) {
+    return { ok: true, reason: "reachable" };
+  }
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
       await syncAllowedOrigins();
@@ -299,6 +345,7 @@ function isGatewayReady() {
 
 async function restartGateway() {
   if (gatewayProc) {
+    intentionalRestart = true;
     try {
       gatewayProc.kill("SIGTERM");
     } catch (err) {
@@ -306,7 +353,10 @@ async function restartGateway() {
     }
     await sleep(750);
     gatewayProc = null;
+    intentionalRestart = false;
   }
+  await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+  gatewayRestartCount = 0;
   return ensureGatewayRunning();
 }
 
@@ -420,14 +470,6 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
 
   const authGroups = [
     {
-      value: "openai",
-      label: "OpenAI",
-      hint: "API key",
-      options: [
-        { value: "openai-api-key", label: "OpenAI API key" },
-      ],
-    },
-    {
       value: "anthropic",
       label: "Anthropic",
       hint: "API key",
@@ -436,11 +478,29 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       ],
     },
     {
+      value: "openai",
+      label: "OpenAI",
+      hint: "API key / Codex",
+      options: [
+        { value: "openai-api-key", label: "OpenAI API key" },
+        { value: "openai-codex", label: "OpenAI Codex (ChatGPT OAuth)" },
+      ],
+    },
+    {
       value: "google",
       label: "Google",
-      hint: "API key",
+      hint: "API key / CLI",
       options: [
         { value: "gemini-api-key", label: "Google Gemini API key" },
+        { value: "google-gemini-cli", label: "Google Gemini CLI (OAuth)" },
+      ],
+    },
+    {
+      value: "deepseek",
+      label: "DeepSeek",
+      hint: "API key",
+      options: [
+        { value: "deepseek-api-key", label: "DeepSeek API key" },
       ],
     },
     {
@@ -450,42 +510,28 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       options: [{ value: "openrouter-api-key", label: "OpenRouter API key" }],
     },
     {
-      value: "ai-gateway",
-      label: "Vercel AI Gateway",
+      value: "xai",
+      label: "xAI (Grok)",
       hint: "API key",
-      options: [
-        { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
-      ],
+      options: [{ value: "xai-api-key", label: "xAI API key" }],
     },
     {
-      value: "moonshot",
-      label: "Moonshot AI",
-      hint: "Kimi K2 + Kimi Code",
-      options: [
-        { value: "moonshot-api-key", label: "Moonshot AI API key" },
-        { value: "kimi-code-api-key", label: "Kimi Code API key" },
-      ],
-    },
-    {
-      value: "zai",
-      label: "Z.AI (GLM 4.7)",
+      value: "mistral",
+      label: "Mistral AI",
       hint: "API key",
-      options: [{ value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" }],
+      options: [{ value: "mistral-api-key", label: "Mistral API key" }],
     },
     {
-      value: "minimax",
-      label: "MiniMax",
-      hint: "M2.1 (recommended)",
-      options: [
-        { value: "minimax-api", label: "MiniMax M2.1" },
-        { value: "minimax-api-lightning", label: "MiniMax M2.1 Lightning" },
-      ],
+      value: "together",
+      label: "Together AI",
+      hint: "API key",
+      options: [{ value: "together-api-key", label: "Together AI API key" }],
     },
     {
-      value: "qwen",
-      label: "Qwen",
-      hint: "OAuth",
-      options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
+      value: "huggingface",
+      label: "Hugging Face",
+      hint: "API key",
+      options: [{ value: "huggingface-api-key", label: "Hugging Face API key" }],
     },
     {
       value: "copilot",
@@ -500,18 +546,152 @@ app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
       ],
     },
     {
+      value: "moonshot",
+      label: "Moonshot AI",
+      hint: "Kimi K2 + Kimi Code",
+      options: [
+        { value: "moonshot-api-key", label: "Moonshot AI API key" },
+        { value: "moonshot-api-key-cn", label: "Moonshot AI API key (CN)" },
+        { value: "kimi-code-api-key", label: "Kimi Code API key" },
+      ],
+    },
+    {
+      value: "minimax",
+      label: "MiniMax",
+      hint: "API key / OAuth",
+      options: [
+        { value: "minimax-global-api", label: "MiniMax API key (Global)" },
+        { value: "minimax-global-oauth", label: "MiniMax OAuth (Global)" },
+        { value: "minimax-cn-api", label: "MiniMax API key (CN)" },
+        { value: "minimax-cn-oauth", label: "MiniMax OAuth (CN)" },
+      ],
+    },
+    {
+      value: "zai",
+      label: "Z.AI (GLM 4.7)",
+      hint: "API key / OAuth",
+      options: [
+        { value: "zai-api-key", label: "Z.AI API key" },
+        { value: "zai-coding-global", label: "Z.AI Coding (Global)" },
+        { value: "zai-coding-cn", label: "Z.AI Coding (CN)" },
+        { value: "zai-global", label: "Z.AI (Global)" },
+        { value: "zai-cn", label: "Z.AI (CN)" },
+      ],
+    },
+    {
+      value: "qwen",
+      label: "Qwen",
+      hint: "OAuth",
+      options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
+    },
+    {
+      value: "modelstudio",
+      label: "Alibaba Model Studio",
+      hint: "Qwen via Alibaba Cloud",
+      options: [
+        { value: "modelstudio-api-key", label: "Coding Plan (Global)" },
+        { value: "modelstudio-api-key-cn", label: "Coding Plan (CN)" },
+        { value: "modelstudio-standard-api-key", label: "Standard Plan (Global)" },
+        { value: "modelstudio-standard-api-key-cn", label: "Standard Plan (CN)" },
+      ],
+    },
+    {
+      value: "venice",
+      label: "Venice AI",
+      hint: "API key",
+      options: [{ value: "venice-api-key", label: "Venice AI API key" }],
+    },
+    {
+      value: "chutes",
+      label: "Chutes",
+      hint: "OAuth / API key",
+      options: [
+        { value: "chutes", label: "Chutes OAuth" },
+        { value: "chutes-api-key", label: "Chutes API key" },
+      ],
+    },
+    {
+      value: "kilocode",
+      label: "Kilocode",
+      hint: "API key",
+      options: [{ value: "kilocode-api-key", label: "Kilocode API key" }],
+    },
+    {
+      value: "xiaomi",
+      label: "Xiaomi",
+      hint: "API key",
+      options: [{ value: "xiaomi-api-key", label: "Xiaomi API key" }],
+    },
+    {
+      value: "volcengine",
+      label: "Volcano Engine (Doubao)",
+      hint: "API key",
+      options: [{ value: "volcengine-api-key", label: "Volcano Engine API key" }],
+    },
+    {
+      value: "byteplus",
+      label: "BytePlus",
+      hint: "API key",
+      options: [{ value: "byteplus-api-key", label: "BytePlus API key" }],
+    },
+    {
+      value: "qianfan",
+      label: "Qianfan (Baidu)",
+      hint: "API key",
+      options: [{ value: "qianfan-api-key", label: "Qianfan API key" }],
+    },
+    {
+      value: "ai-gateway",
+      label: "Vercel AI Gateway",
+      hint: "API key",
+      options: [
+        { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
+      ],
+    },
+    {
+      value: "cloudflare-ai-gateway",
+      label: "Cloudflare AI Gateway",
+      hint: "API key",
+      options: [
+        { value: "cloudflare-ai-gateway-api-key", label: "Cloudflare AI Gateway API key" },
+      ],
+    },
+    {
+      value: "litellm",
+      label: "LiteLLM",
+      hint: "Unified gateway",
+      options: [{ value: "litellm-api-key", label: "LiteLLM API key" }],
+    },
+    {
+      value: "opencode",
+      label: "OpenCode",
+      hint: "Zen / Go",
+      options: [
+        { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+        { value: "opencode-go", label: "OpenCode Go" },
+      ],
+    },
+    {
       value: "synthetic",
       label: "Synthetic",
       hint: "Anthropic-compatible (multi-model)",
       options: [{ value: "synthetic-api-key", label: "Synthetic API key" }],
     },
     {
-      value: "opencode-zen",
-      label: "OpenCode Zen",
-      hint: "API key",
+      value: "self-hosted",
+      label: "Self-hosted",
+      hint: "Ollama / vLLM / SGLang",
       options: [
-        { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+        { value: "ollama", label: "Ollama (local)" },
+        { value: "vllm", label: "vLLM" },
+        { value: "sglang", label: "SGLang" },
       ],
+    },
+    {
+      value: "custom",
+      label: "Custom endpoint",
+      hint: "OpenAI / Anthropic compatible",
+      options: [{ value: "custom-api-key", label: "Custom provider" }],
     },
   ];
 
@@ -552,22 +732,59 @@ function buildOnboardArgs(payload) {
 
     const secret = (payload.authSecret || "").trim();
     const map = {
-      "openai-api-key": "--openai-api-key",
       apiKey: "--anthropic-api-key",
-      "openrouter-api-key": "--openrouter-api-key",
-      "ai-gateway-api-key": "--ai-gateway-api-key",
-      "moonshot-api-key": "--moonshot-api-key",
-      "kimi-code-api-key": "--kimi-code-api-key",
+      "openai-api-key": "--openai-api-key",
       "gemini-api-key": "--gemini-api-key",
+      "deepseek-api-key": "--deepseek-api-key",
+      "openrouter-api-key": "--openrouter-api-key",
+      "xai-api-key": "--xai-api-key",
+      "mistral-api-key": "--mistral-api-key",
+      "together-api-key": "--together-api-key",
+      "huggingface-api-key": "--huggingface-api-key",
+      "moonshot-api-key": "--moonshot-api-key",
+      "moonshot-api-key-cn": "--moonshot-api-key",
+      "kimi-code-api-key": "--kimi-code-api-key",
+      "minimax-global-api": "--minimax-api-key",
+      "minimax-cn-api": "--minimax-api-key",
       "zai-api-key": "--zai-api-key",
-      "minimax-api": "--minimax-api-key",
-      "minimax-api-lightning": "--minimax-api-key",
-      "synthetic-api-key": "--synthetic-api-key",
+      "modelstudio-api-key": "--modelstudio-api-key",
+      "modelstudio-api-key-cn": "--modelstudio-api-key-cn",
+      "modelstudio-standard-api-key": "--modelstudio-standard-api-key",
+      "modelstudio-standard-api-key-cn": "--modelstudio-standard-api-key-cn",
+      "venice-api-key": "--venice-api-key",
+      "chutes-api-key": "--chutes-api-key",
+      "kilocode-api-key": "--kilocode-api-key",
+      "xiaomi-api-key": "--xiaomi-api-key",
+      "volcengine-api-key": "--volcengine-api-key",
+      "byteplus-api-key": "--byteplus-api-key",
+      "qianfan-api-key": "--qianfan-api-key",
+      "ai-gateway-api-key": "--ai-gateway-api-key",
+      "cloudflare-ai-gateway-api-key": "--cloudflare-ai-gateway-api-key",
+      "litellm-api-key": "--litellm-api-key",
       "opencode-zen": "--opencode-zen-api-key",
+      "opencode-go": "--opencode-go-api-key",
+      "synthetic-api-key": "--synthetic-api-key",
+      "custom-api-key": "--custom-api-key",
     };
     const flag = map[payload.authChoice];
     if (flag && secret) {
       args.push(flag, secret);
+    }
+
+    if (payload.authChoice === "custom-api-key") {
+      const baseUrl = (payload.customBaseUrl || "").trim();
+      const modelId = (payload.customModelId || "").trim();
+      const compat = (payload.customCompatibility || "").trim();
+      if (baseUrl) args.push("--custom-base-url", baseUrl);
+      if (modelId) args.push("--custom-model-id", modelId);
+      if (compat) args.push("--custom-compatibility", compat);
+    }
+
+    if (payload.authChoice === "cloudflare-ai-gateway-api-key") {
+      const accountId = (payload.cloudflareAccountId || "").trim();
+      const gatewayId = (payload.cloudflareGatewayId || "").trim();
+      if (accountId) args.push("--cloudflare-ai-gateway-account-id", accountId);
+      if (gatewayId) args.push("--cloudflare-ai-gateway-gateway-id", gatewayId);
     }
 
   }
@@ -600,25 +817,58 @@ function runCmd(cmd, args, opts = {}) {
 }
 
 const VALID_AUTH_CHOICES = [
-  "openai-api-key",
   "apiKey",
+  "openai-api-key",
+  "openai-codex",
   "gemini-api-key",
+  "google-gemini-cli",
+  "deepseek-api-key",
   "openrouter-api-key",
-  "ai-gateway-api-key",
-  "moonshot-api-key",
-  "kimi-code-api-key",
-  "zai-api-key",
-  "minimax-api",
-  "minimax-api-lightning",
-  "qwen-portal",
+  "xai-api-key",
+  "mistral-api-key",
+  "together-api-key",
+  "huggingface-api-key",
   "github-copilot",
   "copilot-proxy",
-  "synthetic-api-key",
+  "moonshot-api-key",
+  "moonshot-api-key-cn",
+  "kimi-code-api-key",
+  "minimax-global-api",
+  "minimax-global-oauth",
+  "minimax-cn-api",
+  "minimax-cn-oauth",
+  "zai-api-key",
+  "zai-coding-global",
+  "zai-coding-cn",
+  "zai-global",
+  "zai-cn",
+  "qwen-portal",
+  "modelstudio-api-key",
+  "modelstudio-api-key-cn",
+  "modelstudio-standard-api-key",
+  "modelstudio-standard-api-key-cn",
+  "venice-api-key",
+  "chutes",
+  "chutes-api-key",
+  "kilocode-api-key",
+  "xiaomi-api-key",
+  "volcengine-api-key",
+  "byteplus-api-key",
+  "qianfan-api-key",
+  "ai-gateway-api-key",
+  "cloudflare-ai-gateway-api-key",
+  "litellm-api-key",
   "opencode-zen",
+  "opencode-go",
+  "synthetic-api-key",
+  "ollama",
+  "vllm",
+  "sglang",
+  "custom-api-key",
 ];
 
 function validatePayload(payload) {
-if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
+  if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     return `Invalid authChoice: ${payload.authChoice}`;
   }
   const stringFields = [
@@ -628,6 +878,11 @@ if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
     "slackAppToken",
     "authSecret",
     "model",
+    "customBaseUrl",
+    "customModelId",
+    "customCompatibility",
+    "cloudflareAccountId",
+    "cloudflareGatewayId",
   ];
   for (const field of stringFields) {
     if (payload[field] !== undefined && typeof payload[field] !== "string") {
@@ -821,10 +1076,18 @@ app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
   try {
+    if (gatewayProc) {
+      intentionalRestart = true;
+      gatewayProc.kill("SIGTERM");
+      await sleep(750);
+      gatewayProc = null;
+      intentionalRestart = false;
+    }
+    await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
     fs.rmSync(configPath(), { force: true });
     res
       .type("text/plain")
-      .send("OK - deleted config file. You can rerun setup now.");
+      .send("OK - stopped gateway and deleted config file. You can rerun setup now.");
   } catch (err) {
     res.status(500).type("text/plain").send(String(err));
   }
@@ -1154,6 +1417,10 @@ proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
 });
 
 app.use(async (req, res) => {
+  if (req.path === "/") {
+    return res.sendFile(path.join(process.cwd(), "src", "public", "loading.html"));
+  }
+
   if (!isConfigured() && !req.path.startsWith("/setup")) {
     return res.redirect("/setup");
   }
@@ -1281,6 +1548,13 @@ async function gracefulShutdown(signal) {
     } catch (err) {
       log.warn("wrapper", `error killing gateway: ${err.message}`);
     }
+  }
+
+  try {
+    const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
+    log.info("wrapper", `gateway stop during shutdown exit=${stopResult.code}`);
+  } catch (err) {
+    log.warn("wrapper", `gateway stop during shutdown failed: ${err.message}`);
   }
 
   process.exit(0);
